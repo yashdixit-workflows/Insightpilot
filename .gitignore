@@ -1,0 +1,39 @@
+# ── Python ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pycache
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ─────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── Secrets & credentials (NEVER commit these) ──────────────────────────
+.env
+.streamlit/secrets.toml
+
+# ── Databases & large data files ─────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+
+# ── IDE / OS ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ── Logs ─────────────────────────────────────────────────────────────────
+*.log
+
+# ── Test / debug scripts ─────────────────────────────────────────────────
+fix_pandas.py
+test_fabric.py
+maintest_pipeline.py
