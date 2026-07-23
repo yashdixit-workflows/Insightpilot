@@ -1,73 +1,121 @@
 """
 fabric_connector.py
-Lightweight pyodbc helper that lets Streamlit query the Microsoft Fabric
-Lakehouse directly, using the same credentials as the fabric-mcp MCP server.
+Connects to Microsoft Fabric SQL Analytics Endpoint using MSAL token auth.
+
+Works on BOTH:
+  - Local development (via .env file)
+  - Streamlit Cloud (via st.secrets)
+
+Auth method: Azure AD Service Principal (Client Credentials flow)
+  → More secure than username/password, works on any cloud host.
+
+Required credentials:
+  FABRIC_SERVER      – SQL Analytics Endpoint hostname
+                       e.g. abc123.datawarehouse.fabric.microsoft.com
+  FABRIC_DATABASE    – Lakehouse or Warehouse name
+  FABRIC_TENANT_ID   – Azure AD Tenant ID (found in Azure Portal → Entra ID)
+  FABRIC_CLIENT_ID   – App Registration Client ID
+  FABRIC_CLIENT_SECRET – App Registration Client Secret
 
 Credential resolution order:
-  1. Streamlit Cloud secrets (st.secrets) — used when deployed on Streamlit Cloud
-  2. .env file in the fabric-mcp directory — used for local fabric-mcp setup
-  3. .env in the project root — general local fallback
+  1. Streamlit Cloud secrets (st.secrets)
+  2. .env file in project root
+  3. Environment variables
 """
 import os
+import struct
 import decimal
 import datetime
 import threading
-import pyodbc
+
 from dotenv import load_dotenv
 
-# Disable connection pooling to avoid threading issues in Streamlit
-pyodbc.pooling = False
-
-# Load credentials from the fabric-mcp .env file (local dev)
-_ENV_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "fabric mcp", "fabric-mcp", ".env")
-load_dotenv(dotenv_path=os.path.abspath(_ENV_PATH), override=False)
-
-# Fallback: also try loading from current working directory
+# Load .env for local dev (no-op on Streamlit Cloud)
 load_dotenv(override=False)
 
 _lock = threading.Lock()
+_FABRIC_SCOPE = "https://analysis.windows.net/powerbi/api/.default"
 
+
+# ── Credential helper ────────────────────────────────────────────────────
 
 def _get_env(key: str) -> str | None:
     """Read a credential — prefers Streamlit Cloud secrets over env vars."""
     try:
         import streamlit as st
-        return st.secrets.get(key) or os.getenv(key)
+        val = st.secrets.get(key)
+        if val:
+            return val
     except Exception:
-        return os.getenv(key)
+        pass
+    return os.getenv(key)
 
 
-def _build_conn_str() -> str:
-    server   = _get_env("FABRIC_SERVER")
-    database = _get_env("FABRIC_DATABASE")
-    username = _get_env("FABRIC_USERNAME")
-    password = _get_env("FABRIC_PASSWORD")
-
-    missing = [k for k, v in {
-        "FABRIC_SERVER": server,
-        "FABRIC_DATABASE": database,
-        "FABRIC_USERNAME": username,
-        "FABRIC_PASSWORD": password,
-    }.items() if not v]
-
+def _check_credentials() -> dict:
+    """Return all required credentials; raise if any are missing."""
+    keys = [
+        "FABRIC_SERVER",
+        "FABRIC_DATABASE",
+        "FABRIC_TENANT_ID",
+        "FABRIC_CLIENT_ID",
+        "FABRIC_CLIENT_SECRET",
+    ]
+    creds = {k: _get_env(k) for k in keys}
+    missing = [k for k, v in creds.items() if not v]
     if missing:
         raise EnvironmentError(
-            f"Missing Fabric credentials in .env: {', '.join(missing)}. "
-            "Ensure FABRIC_SERVER, FABRIC_DATABASE, FABRIC_USERNAME, and FABRIC_PASSWORD are set."
+            f"Missing Fabric credentials: {', '.join(missing)}.\n"
+            "Set them in Streamlit Cloud → App Settings → Secrets, "
+            "or in your local .env file."
+        )
+    return creds
+
+
+# ── MSAL token acquisition ────────────────────────────────────────────────
+
+def _get_access_token(tenant_id: str, client_id: str, client_secret: str) -> str:
+    """
+    Acquire an Azure AD access token using the Client Credentials (app-only) flow.
+    Requires: pip install msal
+    """
+    try:
+        import msal
+    except ImportError:
+        raise ImportError(
+            "msal is required for Fabric SQL auth. "
+            "Add 'msal>=1.28.0' to requirements.txt"
         )
 
-    return (
-        "Driver={ODBC Driver 18 for SQL Server};"
-        f"Server={server};"
-        f"Database={database};"
-        f"UID={username};"
-        f"PWD={password};"
-        "Encrypt=yes;"
-        "TrustServerCertificate=no;"
-        "Authentication=ActiveDirectoryPassword;"
-        "Connection Timeout=60;"
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
+    app = msal.ConfidentialClientApplication(
+        client_id,
+        authority=authority,
+        client_credential=client_secret,
     )
 
+    result = app.acquire_token_for_client(scopes=[_FABRIC_SCOPE])
+
+    if "access_token" not in result:
+        error = result.get("error_description", result.get("error", "Unknown error"))
+        raise RuntimeError(f"Failed to acquire MSAL token: {error}")
+
+    return result["access_token"]
+
+
+# ── pyodbc token auth helper ──────────────────────────────────────────────
+
+def _token_to_odbc_attr(token: str) -> bytes:
+    """
+    Pack the bearer token into the binary format expected by pyodbc
+    when using SQL_COPT_SS_ACCESS_TOKEN attribute.
+    """
+    token_bytes = token.encode("utf-16-le")
+    token_len = len(token_bytes)
+    # Pack as: [len (4 bytes LE)] + [token bytes]
+    return struct.pack(f"<I{token_len}s", token_len, token_bytes)
+
+
+# ── Main query function ───────────────────────────────────────────────────
 
 def _safe_value(v):
     """Convert a pyodbc row value to a JSON/pandas-safe Python type."""
@@ -90,23 +138,59 @@ def _safe_value(v):
 
 def run_fabric_sql(query: str, max_rows: int = 500) -> list[dict]:
     """
-    Execute a T-SQL query against the Fabric Lakehouse and return results
-    as a list of dicts (column_name → value).
+    Execute a T-SQL query against the Fabric SQL Analytics Endpoint.
+
+    Uses MSAL Client Credentials (service principal) auth — works on
+    Streamlit Cloud and any other cloud host without ODBC Driver 18.
 
     Args:
         query:    T-SQL query string
         max_rows: Safety cap on rows returned (default 500)
 
     Returns:
-        List of row dicts, or raises on connection/query failure.
+        List of row dicts {column_name: value}, or raises on failure.
     """
-    conn_str = _build_conn_str()
+    import pyodbc
+
+    pyodbc.pooling = False
+
+    creds = _check_credentials()
+    server   = creds["FABRIC_SERVER"]
+    database = creds["FABRIC_DATABASE"]
+
+    # Get MSAL token
+    token = _get_access_token(
+        tenant_id=creds["FABRIC_TENANT_ID"],
+        client_id=creds["FABRIC_CLIENT_ID"],
+        client_secret=creds["FABRIC_CLIENT_SECRET"],
+    )
+
+    token_attr = _token_to_odbc_attr(token)
+
+    # SQL_COPT_SS_ACCESS_TOKEN = 1256
+    conn_str = (
+        "Driver={ODBC Driver 18 for SQL Server};"
+        f"Server={server},1433;"
+        f"Database={database};"
+        "Encrypt=yes;"
+        "TrustServerCertificate=no;"
+        "Connection Timeout=60;"
+    )
 
     with _lock:
         try:
-            conn = pyodbc.connect(conn_str, timeout=60, autocommit=True)
+            conn = pyodbc.connect(
+                conn_str,
+                attrs_before={1256: token_attr},
+                timeout=60,
+                autocommit=True,
+            )
         except Exception as ex:
-            raise RuntimeError(f"Connection to Fabric failed: {ex}") from ex
+            raise RuntimeError(
+                f"Connection to Fabric failed: {ex}\n\n"
+                "If running on Streamlit Cloud, ensure the ODBC Driver 18 "
+                "system package is available (see packages.txt)."
+            ) from ex
 
         try:
             cursor = conn.cursor()
@@ -135,16 +219,24 @@ def run_fabric_sql(query: str, max_rows: int = 500) -> list[dict]:
                 pass
 
 
+# ── Status helper ─────────────────────────────────────────────────────────
+
 def get_fabric_credentials_status() -> dict:
     """Returns a dict with status info about the Fabric connection credentials."""
-    server   = _get_env("FABRIC_SERVER")
-    database = _get_env("FABRIC_DATABASE")
-    username = _get_env("FABRIC_USERNAME")
-    password = _get_env("FABRIC_PASSWORD")
-    return {
-        "server":   server or "❌ NOT SET",
-        "database": database or "❌ NOT SET",
-        "username": username or "❌ NOT SET",
-        "password": "✅ Set" if password else "❌ NOT SET",
-        "ready":    all([server, database, username, password]),
-    }
+    keys = [
+        "FABRIC_SERVER",
+        "FABRIC_DATABASE",
+        "FABRIC_TENANT_ID",
+        "FABRIC_CLIENT_ID",
+        "FABRIC_CLIENT_SECRET",
+    ]
+    status = {}
+    for k in keys:
+        val = _get_env(k)
+        if k == "FABRIC_CLIENT_SECRET":
+            status[k] = "✅ Set" if val else "❌ NOT SET"
+        else:
+            status[k] = val or "❌ NOT SET"
+
+    status["ready"] = all(_get_env(k) for k in keys)
+    return status

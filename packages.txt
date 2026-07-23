@@ -1,0 +1,4 @@
+# System packages installed by Streamlit Cloud via apt-get
+# Required for Microsoft Fabric SQL connector (pyodbc)
+unixodbc
+unixodbc-dev
